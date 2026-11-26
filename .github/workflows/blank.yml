@@ -1,0 +1,308 @@
+name: ক্যালকু-ফ্লো APK বিল্ড (জিপ থেকে)
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '**.zip'
+      - '.github/workflows/**'
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'শুধু এই জিপটি ব্যবহার করুন (ফাঁকা রাখলে সব জিপ ক্রমে)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      VERSION_CODE: ${{ github.run_number }}
+      VERSION_NAME: 1.0.${{ github.run_number }}
+      GH_TOKEN: ${{ github.token }}
+    defaults:
+      run:
+        working-directory: calcu-app
+
+    steps:
+      - name: কোড নামানো (সব ইতিহাসসহ — জিপের আপলোড-ক্রম জানতে)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ───────────── ১) জিপ খোঁজা → খোলা → সাজানো ─────────────
+      - name: জিপ খোঁজা, খোলা ও ফাইল সাজানো
+        working-directory: .
+        env:
+          ONLY_ZIP: ${{ github.event.inputs.zip_name }}
+        run: |
+          python3 - <<'PY'
+          import os, sys, json, glob, shutil, zipfile, subprocess, tempfile
+
+          DEST = "calcu-app"
+          SUM = open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a", encoding="utf-8")
+          def say(t=""):
+              print(t); SUM.write(t + "\n")
+          def err(t):
+              print("::error::" + t); SUM.write("❌ " + t + "\n")
+
+          # --- জিপ খোঁজা ---
+          tracked = subprocess.run(["git", "ls-files", "*.zip", "**/*.zip"], capture_output=True, text=True).stdout.split("\n")
+          zips = {z for z in tracked if z.strip()}
+          zips |= set(glob.glob("*.zip")) | set(glob.glob("**/*.zip", recursive=True))
+          zips = [z for z in zips if "node_modules" not in z and not z.startswith(DEST + "/") and os.path.isfile(z)]
+          only = (os.environ.get("ONLY_ZIP") or "").strip()
+          if only:
+              zips = [z for z in zips if os.path.basename(z) == os.path.basename(only)]
+          if not zips:
+              err("কোনো .zip ফাইল পাওয়া যায়নি। প্রজেক্টের জিপ ফাইলটি রিপোজিটরির মূল ফোল্ডারে আপলোড করুন, তারপর আবার চালান।")
+              sys.exit(1)
+          def when(z):
+              r = subprocess.run(["git", "log", "-1", "--format=%ct", "--", z], capture_output=True, text=True).stdout.strip()
+              return int(r) if r.isdigit() else int(os.path.getmtime(z))
+          zips.sort(key=lambda z: (when(z), z))
+          say("## 📦 জিপ ফাইল (পুরোনো → নতুন ক্রমে)")
+          for z in zips: say(f"- `{z}` ({os.path.getsize(z)//1024} KB)")
+
+          # --- প্রজেক্ট-রুট খোঁজা ---
+          def find_root(base):
+              full = []; part = []
+              for r, d, f in os.walk(base):
+                  if "__MACOSX" in r or "node_modules" in r or "/.git" in r: continue
+                  if "capacitor.config.json" in f and os.path.exists(os.path.join(r, "www", "index.html")): full.append(r)
+                  elif any(x in d for x in ("www", "android-overlay", "scripts")) and "android-overlay" not in r: part.append(r)
+              key = lambda p: p.count(os.sep)
+              if full: return sorted(full, key=key)[0], True
+              if part: return sorted(part, key=key)[0], False
+              return base, False
+
+          def read_info(base, root):
+              for cand in (os.path.join(root, "ZIP-INFO.json"), os.path.join(base, "ZIP-INFO.json")):
+                  if os.path.exists(cand):
+                      try: return json.load(open(cand, encoding="utf-8"))
+                      except Exception: pass
+              return {}
+
+          def copy_tree(src, dst):
+              for r, d, f in os.walk(src):
+                  d[:] = [x for x in d if x not in ("__MACOSX", ".git", "node_modules", ".github")]
+                  rel = os.path.relpath(r, src)
+                  os.makedirs(os.path.join(dst, rel), exist_ok=True)
+                  for x in f:
+                      if x == ".DS_Store": continue
+                      shutil.copy2(os.path.join(r, x), os.path.join(dst, rel, x))
+
+          if os.path.exists(DEST): shutil.rmtree(DEST)
+          os.makedirs(DEST)
+          say("\n## 🧩 সাজানোর ধাপ")
+          for z in zips:
+              tmp = tempfile.mkdtemp()
+              try:
+                  with zipfile.ZipFile(z) as zf: zf.extractall(tmp)
+              except Exception as e:
+                  err(f"{z} খোলা যায়নি: {e}"); continue
+              root, looks_full = find_root(tmp)
+              info = read_info(tmp, root)
+              mode = (info.get("mode") or ("full" if looks_full else "patch")).lower()
+              if mode == "full":
+                  shutil.rmtree(DEST); os.makedirs(DEST)
+                  say(f"- `{z}` → **সম্পূর্ণ প্রজেক্ট** (আগেরটা বদলে নতুনটা বসল) — রুট: `{os.path.relpath(root, tmp)}`")
+              else:
+                  say(f"- `{z}` → **প্যাচ** (আগের ওপর নতুন/বদলানো ফাইল যোগ) — রুট: `{os.path.relpath(root, tmp)}`")
+              copy_tree(root, DEST)
+              rm = os.path.join(root, ".remove-files")
+              if os.path.exists(rm):
+                  for line in open(rm, encoding="utf-8").read().splitlines():
+                      line = line.strip()
+                      if not line or line.startswith("#") or ".." in line: continue
+                      t = os.path.join(DEST, line)
+                      if os.path.isdir(t): shutil.rmtree(t, ignore_errors=True)
+                      elif os.path.exists(t): os.remove(t)
+                      say(f"  - বাদ দেওয়া হলো: `{line}`")
+              shutil.rmtree(tmp, ignore_errors=True)
+
+          # পুরোনো জেনারেট-হওয়া ফোল্ডার থাকলে মুছে ফেলা (cap add নতুন করে বানাবে)
+          for junk in ("android", "node_modules", "dist", "app.tar.xz"):
+              p = os.path.join(DEST, junk)
+              if os.path.isdir(p): shutil.rmtree(p, ignore_errors=True)
+              elif os.path.exists(p): os.remove(p)
+
+          # --- আবশ্যক ফাইল যাচাই ---
+          need = ["package.json", "capacitor.config.json", "www/index.html", "scripts/patch-android.mjs",
+                  "scripts/make-icons.py", "scripts/check-www.mjs", "resources/logo.png", "android-overlay/java"]
+          miss = [n for n in need if not os.path.exists(os.path.join(DEST, n))]
+          if miss:
+              err("জিপে এই আবশ্যক ফাইল/ফোল্ডার পাওয়া যায়নি: " + ", ".join(miss) +
+                  " — পুরো প্রজেক্টের জিপটি আপলোড করুন (ZIP-INFO.json-এ mode: full)।")
+              sys.exit(1)
+          # সাইনিং কী না থাকলে নতুন বানানো
+          ks = os.path.join(DEST, "keystore", "jonaki-release.jks")
+          if not os.path.exists(ks):
+              os.makedirs(os.path.dirname(ks), exist_ok=True)
+              subprocess.run(["keytool", "-genkeypair", "-keystore", ks, "-storepass", "jonaki-release", "-keypass", "jonaki-release",
+                              "-alias", "jonaki", "-keyalg", "RSA", "-keysize", "2048", "-validity", "36500",
+                              "-dname", "CN=Calcu-Flow, O=Jonaki, C=BD"], check=True)
+              say("\n⚠️ জিপে সাইনিং-কী ছিল না — নতুন একটি তৈরি হলো। আগে অন্য কী দিয়ে ইনস্টল করা থাকলে আগে সেটি আনইনস্টল করে ইনস্টল করুন।")
+          say("\n✅ ফাইল সাজানো শেষ — প্রজেক্ট এখন `calcu-app/` ফোল্ডারে।")
+          PY
+
+      # ───────────── ২) টুলস ─────────────
+      - name: Node.js ২২
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Java ২১
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Gradle ক্যাশ
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.zip', '.github/workflows/*.yml') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # ───────────── ৩) ফিচার স্ক্যান, নতুন প্যাডের উইজেট নিজে বানানো, আইকন ─────────────
+      - name: ছবি-টুল (Pillow) ইনস্টল
+        run: pip install pillow --break-system-packages -q || pip install pillow -q
+
+      - name: নতুন প্যাডের লোগো ও উইজেট নিজে-নিজে বানানো
+        run: node scripts/autowire-pads.mjs
+
+      - name: অ্যাপ-আইকন, স্প্ল্যাশ ও লোগো বানানো
+        run: python3 scripts/make-icons.py
+
+      - name: ওয়েব-ফাইল যাচাই (সব স্ক্রিপ্টের সিনট্যাক্স)
+        run: node scripts/check-www.mjs
+
+      - name: ফিচার-তালিকা তৈরি ও আগের রিলিজের সাথে মেলানো
+        run: |
+          node scripts/inventory.mjs --out features.json
+          mkdir -p prev
+          PREV_TAG=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ]; then gh release download "$PREV_TAG" -p features.json -D prev --clobber 2>/dev/null || true; fi
+          python3 - <<'PY'
+          import json, os
+          cur = json.load(open("features.json", encoding="utf-8"))
+          out = open(os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null"), "a", encoding="utf-8")
+          def w(t=""): print(t); out.write(t + "\n")
+          w("## 🧭 এই বিল্ডের ফিচার-তালিকা")
+          w("- **প্যাড (" + str(len(cur["pads"])) + "):** " + ", ".join(p["label"] for p in cur["pads"]))
+          w("- **ওমনি-ফাইন্ডার টুল:** " + str(len(cur["omniTools"])) + "টি")
+          w("- **অনুমতি:** " + str(len(cur["permissions"])) + "টি")
+          w("- **ফিচার:** " + ", ".join(cur["features"]))
+          if cur["nativeModules"]["extraModules"]: w("- **অতিরিক্ত নেটিভ মডিউল:** " + ", ".join(cur["nativeModules"]["extraModules"]))
+          pp = "prev/features.json"
+          if os.path.exists(pp):
+              old = json.load(open(pp, encoding="utf-8"))
+              def ids(x, k): return {i.get("id") if isinstance(i, dict) else i for i in x.get(k, [])}
+              for k, nm in (("pads", "প্যাড"), ("omniTools", "ওমনি-টুল"), ("permissions", "অনুমতি"), ("features", "ফিচার")):
+                  a, b = ids(cur, k), ids(old, k)
+                  if a - b: w(f"- 🆕 নতুন {nm}: " + ", ".join(sorted(a - b)))
+                  if b - a: w(f"- ➖ বাদ গেছে {nm}: " + ", ".join(sorted(b - a)))
+          else:
+              w("- (আগের রিলিজ নেই — তুলনা বাদ)")
+          PY
+
+      # ───────────── ৪) Android প্রজেক্ট তৈরি ও প্যাচ ─────────────
+      - name: npm প্যাকেজ ইনস্টল
+        run: npm install --legacy-peer-deps --no-audit --no-fund
+
+      - name: Android প্রজেক্ট তৈরি (Capacitor)
+        run: npx cap add android
+
+      - name: সাইনিং কী (সিক্রেট থাকলে সেটা, নইলে জিপের কী)
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KS_B64" ]; then
+            echo "$KS_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "JN_KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "JN_STORE_PASS=$KS_PASS" >> "$GITHUB_ENV"
+            echo "JN_KEY_ALIAS=${KS_ALIAS:-jonaki}" >> "$GITHUB_ENV"
+            echo "JN_KEY_PASS=${KS_KEYPASS:-$KS_PASS}" >> "$GITHUB_ENV"
+            echo "নিজের সিক্রেট কী ব্যবহার হচ্ছে"
+          else
+            echo "জিপের keystore/jonaki-release.jks ব্যবহার হচ্ছে"
+          fi
+
+      - name: নেটিভ কোড, অনুমতি, উইজেট, মডিউল ও আইকন বসানো
+        run: node scripts/patch-android.mjs
+
+      - name: ওয়েব ফাইল সিঙ্ক
+        run: npx cap sync android
+
+      # ───────────── ৫) বিল্ড ─────────────
+      - name: APK বিল্ড (release, সাইন করা)
+        working-directory: calcu-app/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      # ───────────── ৬) যাচাই: সব উইজেট/অনুমতি/সার্ভিস সত্যিই APK-তে ঢুকেছে কিনা ─────────────
+      - name: মার্জ-করা ম্যানিফেস্টে উইজেট, অনুমতি ও সার্ভিস যাচাই
+        run: |
+          MM=$(find android/app/build/intermediates -path '*release*' -name AndroidManifest.xml 2>/dev/null | grep -i merged_manifest | head -n 1)
+          [ -z "$MM" ] && MM=$(find android/app/build/intermediates -name AndroidManifest.xml 2>/dev/null | grep -i release | head -n 1)
+          echo "ম্যানিফেস্ট: $MM"
+          { echo '## 🔍 APK-এর ম্যানিফেস্ট যাচাই'; echo '```'; node scripts/verify-build.mjs "$MM" features.json; echo '```'; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: APK এর নাম ঠিক করা
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          test -n "$APK" || { echo "APK পাওয়া যায়নি"; exit 1; }
+          mkdir -p dist
+          cp "$APK" "dist/CalcuFlow-${VERSION_NAME}.apk"
+          cp features.json dist/features.json
+          ls -la dist
+
+      - name: রিলিজের বিবরণ লেখা
+        run: |
+          python3 - <<'PY'
+          import json, os
+          f = json.load(open("features.json", encoding="utf-8"))
+          L = ["ক্যালকু-ফ্লো (জোনাকি) Android APK — বিল্ড #" + os.environ.get("VERSION_CODE", ""), "",
+               "নিচের `.apk` ফাইলটি ফোনে নামিয়ে ইনস্টল করুন।", "",
+               "**প্যাড:** " + ", ".join(p["label"] for p in f["pads"]), "",
+               "**হোম-স্ক্রিন উইজেট:** প্রতিটি প্যাডের উইজেট, লম্বা সব-প্যাড উইজেট ও ওমনি-ফাইন্ডারের সার্চ-উইজেট (অ্যাপের সেটিংস থেকেও বসানো যায়)।", "",
+               "**ফিচার:** " + ", ".join(f["features"])]
+          open("release-body.md", "w", encoding="utf-8").write("\n".join(L))
+          PY
+
+      - name: APK আপলোড (Actions → Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CalcuFlow-APK
+          path: |
+            calcu-app/dist/*.apk
+            calcu-app/dist/features.json
+          retention-days: 90
+
+      - name: GitHub Release তৈরি (Releases পেজ থেকে সরাসরি ডাউনলোড)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: ক্যালকু-ফ্লো ${{ env.VERSION_NAME }}
+          body_path: calcu-app/release-body.md
+          files: |
+            calcu-app/dist/*.apk
+            calcu-app/dist/features.json
